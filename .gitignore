@@ -1,0 +1,30 @@
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[co]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment & secrets
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LangChain / Agent
+.langsmith/
+chroma_db/
