@@ -14,7 +14,14 @@ Agent 的核心骨架就是下面这个循环：
 
 import asyncio
 import json
+import os
+from typing import Optional
+
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# .env 文件中的敏感配置统一在这里加载
+load_dotenv()
 
 # ==========================================================
 # 第一步：模型调用（最底层，nothing magic）
@@ -23,18 +30,24 @@ from openai import OpenAI
 # 和你用 Postman 调 /v1/chat/completions 没有区别。
 
 client = OpenAI(
-    api_key="your-deepseek-api-key",   # 替换为你的 DeepSeek API key
-    base_url="https://api.deepseek.com"
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
 )
 
-def ask_llm(messages: list[dict]) -> str:
-    """最朴素的 LLM 调用：发消息，拿回复"""
-    response = client.chat.completions.create(
-        model="deepseek-v4-pro",          # DeepSeek V4 Pro
-        messages=messages,
-        temperature=0.2,              # Agent 场景建议低温度，保证稳定性
-    )
-    return response.choices[0].message.content
+def ask_llm(messages: list[dict], tools: Optional[list[dict]] = None):
+    """
+    LLM 调用 —— 兼容 Function Calling
+    返回 ChoiceMessage 对象，上层根据 .tool_calls / .content 判断行为
+    """
+    kwargs = {
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    if tools:
+        kwargs["tools"] = tools
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message
 
 
 # ==========================================================
@@ -65,79 +78,71 @@ def calculate(expression: str) -> str:
     except Exception as e:
         return f"计算错误: {e}"
 
-# 工具注册表：描述 + 函数 一一对应
-TOOLS = {
-    "search": {
-        "function": search,
-        "description": "搜索外部信息。参数: query (搜索关键词)"
-    },
-    "calculate": {
-        "function": calculate,
-        "description": "执行数学计算。参数: expression (数学表达式, 如 '2+3*4')"
-    }
+# 工具实现：名称 → 函数 映射
+TOOL_FUNCTIONS = {
+    "search": search,
+    "calculate": calculate,
 }
 
+# 工具 Schema：OpenAI 原生 tools 格式（JSON Schema 描述）
+# 模型看到这个就会自动返回结构化的 tool_calls，不需要文本解析
+# 所有可用工具的汇总描述
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "搜索外部信息",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索关键词"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "执行数学计算",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "数学表达式，如 '2+3*4'"
+                    }
+                },
+                "required": ["expression"]
+            }
+        }
+    }
+]
+
 
 # ==========================================================
-# 第三步：让模型"知道"它能用什么工具
+# 第三步：System Prompt（极简版）
 # ==========================================================
-# 这里不用 OpenAI 的 function calling，
-# 而是用最原始的方式——把工具说明写在 prompt 里。
-# 这样做是为了让你理解本质，后面再换 function calling。
+# 工具信息不再写在 prompt 里，而是通过 tools 参数传给 API。
+# 模型会自动根据 tools schema 决定是否调用工具、调用哪个。
+# 不再需要手写 TOOL:/ARGS: 格式！
 
-SYSTEM_PROMPT = f"""
-你是一个智能助手，你可以使用以下工具：
-
-1. search(query) - {TOOLS['search']['description']}
-2. calculate(expression) - {TOOLS['calculate']['description']}
-
-当你需要调用工具时，必须严格用以下格式回复：
-TOOL: <工具名>
-ARGS: <JSON格式参数>
-
-当你得到最终答案时，直接回复用户，不要用 TOOL 格式。
-
-示例：
-  用户: 杭州在哪里？
-  你:    TOOL: search
-         ARGS: {{"query": "杭州"}}
-
-  用户: 3+5等于几？
-  你:    TOOL: calculate
-         ARGS: {{"expression": "3+5"}}
-"""
+SYSTEM_PROMPT = "你是一个智能助手。如果需要搜索信息或进行计算，请使用可用的工具。"
 
 
 # ==========================================================
-# 第四步：解析模型的输出（它到底想调用工具还是直接回答？）
+# 第四步：工具调用解析（原生 tool_calls，不再手动拆文本）
 # ==========================================================
-
-def parse_llm_response(response: str) -> dict:
-    """
-    解析模型输出，判断它是：
-    - "tool_call": 需要调用工具（包含工具名和参数）
-    - "final":    最终回答
-    """
-    if "TOOL:" in response:
-        # 简陋但直观的解析：找到 TOOL 和 ARGS
-        lines = response.strip().split("\n")
-        tool_name = None
-        args_str = None
-        for line in lines:
-            if line.startswith("TOOL:"):
-                tool_name = line.replace("TOOL:", "").strip()
-            elif line.startswith("ARGS:"):
-                args_str = line.replace("ARGS:", "").strip()
-        if tool_name and args_str:
-            try:
-                return {
-                    "type": "tool_call",
-                    "tool": tool_name,
-                    "args": json.loads(args_str)
-                }
-            except json.JSONDecodeError:
-                pass
-    return {"type": "final", "content": response}
+# 当模型需要调工具时，message.tool_calls 会包含结构化的调用信息：
+#   tool_calls[0].id               → "call_xxx"（唯一标识）
+#   tool_calls[0].function.name    → "search"
+#   tool_calls[0].function.arguments → '{"query": "杭州"}'（JSON 字符串，不会解析错）
+# 不再需要手写文本解析，不再有解析失败的情况。
 
 
 # ==========================================================
@@ -148,13 +153,12 @@ def parse_llm_response(response: str) -> dict:
 
 async def agent_run(user_input: str, max_steps: int = 5):
     """
-    Agent 主循环
+    Agent 主循环（原生 Function Calling 版本）
 
     参数:
         user_input: 用户问题
-        max_steps:  最大循环次数，防止无限循环（安全兜底）
+        max_steps:  最大循环次数，防止无限循环
     """
-    # 初始化对话历史
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input}
@@ -167,38 +171,48 @@ async def agent_run(user_input: str, max_steps: int = 5):
     for step in range(1, max_steps + 1):
         print(f"\n--- 第 {step} 步 ---")
 
-        # 5.1 获取模型输出
-        response = ask_llm(messages)
-        print(f"模型输出:\n{response}")
+        # 5.1 调用模型（传入 tools schema）
+        msg = ask_llm(messages, tools=TOOL_SCHEMAS)
 
-        # 5.2 解析输出：是要调工具还是最终回答？
-        parsed = parse_llm_response(response)
+        # 🔍 模型原始输出（JSON 格式），可以看到 tool_calls 的完整结构
+        print(f"\n{'='*40}")
+        print("📦 模型原始输出 (model_dump_json):")
+        print("="*40)
+        print(msg.model_dump_json(indent=2, exclude_unset=True))
+        print("="*40)
 
-        if parsed["type"] == "final":
-            # 没有 TOOL 标记 → 这就是最终答案
-            print(f"\n✅ 最终回答: {parsed['content']}")
-            return parsed["content"]
+        # 5.2 判断：tool_calls 有值 → 模型要调工具；无值 → 最终回答
+        if not msg.tool_calls:
+            print(f"模型输出:\n{msg.content}")
+            print(f"\n✅ 最终回答: {msg.content}")
+            return msg.content
 
-        if parsed["type"] == "tool_call":
-            tool_name = parsed["tool"]
-            args = parsed["args"]
+        # 5.3 模型要调工具
+        # 先把这条 assistant 消息（含 tool_calls）加入历史
+        messages.append(msg.model_dump())  # ChatCompletionMessage → dict
 
-            if tool_name not in TOOLS:
+        for tool_call in msg.tool_calls:
+            tool_name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+
+            print(f"模型输出: 要调用 {tool_name}({args})")
+
+            if tool_name not in TOOL_FUNCTIONS:
                 print(f"❌ 未知工具: {tool_name}")
-                break
+                continue
 
-            # 5.3 执行工具
+            # 5.4 执行工具
             print(f"🔧 调用工具: {tool_name}({args})")
-            tool_result = TOOLS[tool_name]["function"](**args)
+            tool_result = TOOL_FUNCTIONS[tool_name](**args)
             print(f"📋 工具结果: {tool_result}")
 
-            # 5.4 把"我调了工具，结果是..."作为新消息喂回模型
-            messages.append({"role": "assistant", "content": response})
+            # 5.5 把执行结果以 tool 角色消息喂回（注意 role 是 "tool"，不是 "user"）
             messages.append({
-                "role": "user",
-                "content": f"工具执行结果: {tool_result}\n\n请根据这个结果继续回答用户的问题。"
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_result
             })
-            # 回到循环开头 → 模型看到结果后继续思考
+        # 回到循环开头 → 模型看到工具结果后继续思考
 
     print("\n⚠️ 达到最大步数限制，Agent 停止")
 
@@ -229,8 +243,7 @@ if __name__ == "__main__":
 # 附录：下一步可以做什么
 # ==========================================================
 #
-# 1. 换成 OpenAI Function Calling —— 把 TOOL 文本解析换成原生 tool_call
-#    https://platform.openai.com/docs/guides/function-calling
+# ✅ 1. 原生 Function Calling —— 已完成（TOOL_SCHEMAS + tool_calls）
 #
 # 2. 用 LangGraph 替换手写循环 —— 状态图管理更复杂的流程
 #    https://langchain-ai.github.io/langgraph/
